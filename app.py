@@ -25,65 +25,80 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Google Sheets 連線模組 (核心修改) ---
-SHEET_NAME = "我的持股庫存"  # 請確保你的 Google Sheet 叫這個名字
+# --- 2. Google Sheets 連線與讀取 (搬到最上方以便側邊欄使用) ---
+SHEET_NAME = "我的持股庫存"
 
 def get_gspread_client():
-    # 從 Streamlit Secrets 讀取憑證
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        # 讀取 secrets.toml 中的 [gcp_service_account] 區塊
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
-        st.error(f"Google 雲端連線失敗，請檢查 Secrets 設定：{str(e)}")
+        # 若連線失敗不報錯，避免影響主畫面渲染，僅在 Tab 4 提示
         return None
 
 def load_portfolio_gs():
     client = get_gspread_client()
     if not client: return pd.DataFrame()
-    
     try:
         sheet = client.open(SHEET_NAME).sheet1
         data = sheet.get_all_records()
-        if not data:
-            # 如果是空的，回傳預設格式
-            return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
+        if not data: return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
         return pd.DataFrame(data)
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error(f"找不到名為 '{SHEET_NAME}' 的試算表。請確認已建立並分享給機器人。")
-        return pd.DataFrame({'代號': [], '買入均價': [], '持有股數': []})
-    except Exception as e:
-        st.error(f"讀取試算表錯誤：{str(e)}")
+    except:
         return pd.DataFrame()
 
 def save_portfolio_gs(df):
     client = get_gspread_client()
     if not client: return
-    
     try:
         sheet = client.open(SHEET_NAME).sheet1
-        # 清空舊資料並寫入新資料
         sheet.clear()
-        # gspread 需要將 DataFrame 轉為 list of lists，並包含標題
         sheet.update([df.columns.values.tolist()] + df.values.tolist())
         st.success("✅ 資料已同步寫入 Google Sheets！")
     except Exception as e:
         st.error(f"寫入試算表失敗：{str(e)}")
 
-# --- 3. 側邊欄 ---
+# --- 3. 側邊欄 (動態選單邏輯) ---
 with st.sidebar:
     st.header("🏯 指揮中心")
-    stock_options = {
+    
+    # A. 預設觀察名單
+    default_options = {
         "鴻海 (2317)": "2317.TW", "南亞科 (2408)": "2408.TW", "台積電 (2330)": "2330.TW",
         "聯發科 (2454)": "2454.TW", "廣達 (2382)": "2382.TW", "長榮 (2603)": "2603.TW",
         "元大台灣50 (0050)": "0050.TW", "元大高股息 (0056)": "0056.TW",
         "世界先進 (5347)": "5347.TWO", "輝達 (NVDA)": "NVDA", "蘋果 (AAPL)": "AAPL"
     }
-    selected_stock_name = st.sidebar.selectbox("標的選擇", list(stock_options.keys()))
-    ticker_symbol = stock_options[selected_stock_name]
+    
+    # B. 從 Google Sheet 抓取庫存名單
+    portfolio_options = {}
+    try:
+        my_portfolio = load_portfolio_gs()
+        if not my_portfolio.empty and '代號' in my_portfolio.columns:
+            my_stocks = my_portfolio['代號'].astype(str).unique().tolist()
+            for stock in my_stocks:
+                # 簡單過濾空值
+                if stock and stock.strip():
+                    portfolio_options[f"💰 [庫存] {stock}"] = stock
+    except:
+        pass # 讀取失敗就算了，用預設的
+    
+    # C. 合併名單 (庫存優先顯示)
+    # 這裡做一個反向查找，避免重複加入已在預設名單中的股票
+    final_options = portfolio_options.copy()
+    existing_tickers = list(portfolio_options.values())
+    
+    for name, ticker in default_options.items():
+        if ticker not in existing_tickers:
+            final_options[name] = ticker
+            
+    # 顯示選單
+    selected_stock_name = st.sidebar.selectbox("標的選擇", list(final_options.keys()))
+    ticker_symbol = final_options[selected_stock_name]
+    
     days_to_show = st.sidebar.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
     if st.button("🔄 刷新數據"): st.cache_data.clear()
@@ -201,6 +216,7 @@ try:
         with tab2:
             if signals['wash_detected']: st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
             st.info(f"目前位階：{signals['position']}")
+            st.write("(詳細 AI 診斷請參閱前版)")
 
         with tab3:
             try:
@@ -219,15 +235,10 @@ try:
                     m2.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
             except: st.warning("暫無財報數據")
 
-        # === Tab 4: Google Sheets 庫存管理 ===
         with tab4:
             st.subheader("💰 雲端庫存管理 (Google Sheets 同步)")
-            st.caption(f"資料來源：Google Sheet '{SHEET_NAME}' | 狀態：即時連線中")
-
-            # 1. 從 Google Sheets 讀取
             portfolio_df = load_portfolio_gs()
 
-            # 2. 顯示可編輯表格
             if not portfolio_df.empty:
                 edited_df = st.data_editor(
                     portfolio_df,
@@ -241,22 +252,17 @@ try:
                     key="gs_editor"
                 )
 
-                # 3. 儲存與計算
                 c1, c2 = st.columns([1, 1])
-                with c1:
-                    save_btn = st.button("💾 儲存回 Google Sheets", type="primary")
-                with c2:
-                    calc_btn = st.button("🚀 僅計算損益 (不存檔)")
+                with c1: save_btn = st.button("💾 儲存回 Google Sheets", type="primary")
+                with c2: calc_btn = st.button("🚀 僅計算損益 (不存檔)")
 
                 if save_btn:
                     save_portfolio_gs(edited_df)
-                    st.rerun() # 重新整理頁面以顯示最新數據
+                    st.rerun() # 儲存後重新整理頁面，讓左側選單同步更新
 
                 if save_btn or calc_btn:
-                    # 計算邏輯
                     tickers = edited_df['代號'].astype(str).unique().tolist()
                     live_prices = get_live_prices(tickers)
-                    
                     res_df = edited_df.copy()
                     res_df['現價'] = res_df['代號'].map(live_prices).fillna(0)
                     res_df['市值'] = res_df['現價'] * res_df['持有股數']
@@ -266,21 +272,19 @@ try:
                     
                     total_val = res_df['市值'].sum()
                     total_pl = res_df['損益'].sum()
-                    
                     st.divider()
                     st.metric("總資產市值", f"${total_val:,.0f}", f"{total_pl:+,.0f}")
                     
                     def color_pl(val):
                         color = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
                         return f'color: {color}; font-weight: bold'
-                        
                     st.dataframe(
                         res_df.style.map(color_pl, subset=['損益', '報酬率%'])
                         .format({'現價':"{:.2f}", '市值':"{:,.0f}", '損益':"{:+,.0f}", '報酬率%':"{:+.2f}%"}),
                         use_container_width=True
                     )
             else:
-                st.warning("無法讀取 Google Sheet，請檢查連線設定 (Secrets)。")
+                st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
 
 except Exception as e:
     st.error(f"系統錯誤：{str(e)}")
