@@ -6,8 +6,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import io
-
-# --- 新增：Google Sheets 連線套件 ---
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -19,13 +17,41 @@ st.markdown("""
     .stApp { background-color: #f1f3f6; }
     .block-container { padding-top: 1rem; padding-bottom: 2rem; }
     .css-card { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 20px; border: 1px solid #e0e0e0; }
+    
+    /* 診斷報告樣式 (恢復) */
     .report-box { background-color: white; padding: 20px; border-radius: 10px; border-left: 6px solid #1a237e; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    .report-item { margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+    .report-label { font-weight: bold; color: #424242; }
+    .report-view { color: #1565c0; font-weight: bold; }
+    .report-action { color: #d84315; font-weight: bold; }
+
     .wash-sale-alert { background-color: #e3f2fd; color: #0d47a1; padding: 15px; border-radius: 8px; border: 2px solid #0d47a1; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .dupont-tag { font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; background: #fff3e0; color: #e65100; border: 1px solid #e65100; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Google Sheets 連線與讀取 (搬到最上方以便側邊欄使用) ---
+# --- 2. 定義全域股票清單 ---
+DEFAULT_STOCKS = {
+    "鴻海 (2317)": "2317.TW", "南亞科 (2408)": "2408.TW", "台積電 (2330)": "2330.TW",
+    "聯發科 (2454)": "2454.TW", "廣達 (2382)": "2382.TW", "長榮 (2603)": "2603.TW",
+    "元大台灣50 (0050)": "0050.TW", "元大高股息 (0056)": "0056.TW",
+    "世界先進 (5347)": "5347.TWO", "輝達 (NVDA)": "NVDA", "蘋果 (AAPL)": "AAPL",
+    "國泰永續高股息 (00878)": "00878.TW", "群益台灣精選高息 (00919)": "00919.TW",
+    "復華台灣科技優息 (00929)": "00929.TW"
+}
+SYMBOL_TO_NAME = {v: k for k, v in DEFAULT_STOCKS.items()}
+
+# --- 3. 輔助函數 ---
+@st.cache_data(ttl=86400)
+def get_stock_display_name(symbol):
+    if symbol in SYMBOL_TO_NAME: return SYMBOL_TO_NAME[symbol]
+    try:
+        t = yf.Ticker(symbol)
+        name = t.info.get('shortName') or t.info.get('longName') or symbol
+        return f"{name} ({symbol.replace('.TW', '').replace('.TWO', '')})"
+    except: return symbol
+
+# --- 4. Google Sheets 連線 ---
 SHEET_NAME = "我的持股庫存"
 
 def get_gspread_client():
@@ -35,9 +61,7 @@ def get_gspread_client():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
-    except Exception as e:
-        # 若連線失敗不報錯，避免影響主畫面渲染，僅在 Tab 4 提示
-        return None
+    except: return None
 
 def load_portfolio_gs():
     client = get_gspread_client()
@@ -47,8 +71,7 @@ def load_portfolio_gs():
         data = sheet.get_all_records()
         if not data: return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
         return pd.DataFrame(data)
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def save_portfolio_gs(df):
     client = get_gspread_client()
@@ -58,52 +81,38 @@ def save_portfolio_gs(df):
         sheet.clear()
         sheet.update([df.columns.values.tolist()] + df.values.tolist())
         st.success("✅ 資料已同步寫入 Google Sheets！")
-    except Exception as e:
-        st.error(f"寫入試算表失敗：{str(e)}")
+    except Exception as e: st.error(f"寫入試算表失敗：{str(e)}")
 
-# --- 3. 側邊欄 (動態選單邏輯) ---
+# --- 5. 側邊欄 ---
 with st.sidebar:
     st.header("🏯 指揮中心")
-    
-    # A. 預設觀察名單
-    default_options = {
-        "鴻海 (2317)": "2317.TW", "南亞科 (2408)": "2408.TW", "台積電 (2330)": "2330.TW",
-        "聯發科 (2454)": "2454.TW", "廣達 (2382)": "2382.TW", "長榮 (2603)": "2603.TW",
-        "元大台灣50 (0050)": "0050.TW", "元大高股息 (0056)": "0056.TW",
-        "世界先進 (5347)": "5347.TWO", "輝達 (NVDA)": "NVDA", "蘋果 (AAPL)": "AAPL"
-    }
-    
-    # B. 從 Google Sheet 抓取庫存名單
-    portfolio_options = {}
+    final_options = {}
     try:
         my_portfolio = load_portfolio_gs()
         if not my_portfolio.empty and '代號' in my_portfolio.columns:
             my_stocks = my_portfolio['代號'].astype(str).unique().tolist()
-            for stock in my_stocks:
-                # 簡單過濾空值
-                if stock and stock.strip():
-                    portfolio_options[f"💰 [庫存] {stock}"] = stock
-    except:
-        pass # 讀取失敗就算了，用預設的
+            for stock_symbol in my_stocks:
+                if stock_symbol and stock_symbol.strip():
+                    display_name = get_stock_display_name(stock_symbol)
+                    final_options[f"💰 [庫存] {display_name}"] = stock_symbol
+    except: pass
     
-    # C. 合併名單 (庫存優先顯示)
-    # 這裡做一個反向查找，避免重複加入已在預設名單中的股票
-    final_options = portfolio_options.copy()
-    existing_tickers = list(portfolio_options.values())
-    
-    for name, ticker in default_options.items():
-        if ticker not in existing_tickers:
-            final_options[name] = ticker
+    existing_symbols = list(final_options.values())
+    for name, symbol in DEFAULT_STOCKS.items():
+        if symbol not in existing_symbols: final_options[name] = symbol
             
-    # 顯示選單
-    selected_stock_name = st.sidebar.selectbox("標的選擇", list(final_options.keys()))
-    ticker_symbol = final_options[selected_stock_name]
+    if final_options:
+        selected_stock_label = st.sidebar.selectbox("標的選擇", list(final_options.keys()))
+        ticker_symbol = final_options[selected_stock_label]
+    else:
+        st.sidebar.warning("無法讀取庫存與預設清單")
+        ticker_symbol = "2330.TW"
     
     days_to_show = st.sidebar.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
     if st.button("🔄 刷新數據"): st.cache_data.clear()
 
-# --- 4. 資料引擎 ---
+# --- 6. 資料引擎 ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
@@ -142,9 +151,12 @@ def load_fundamentals(symbol):
         is_stmt = pd.DataFrame()
     return info, bs, is_stmt
 
+# --- 7. AI 訊號產生器 (完整恢復版) ---
 def generate_signals(df, high, low):
     last_close = df['Close'].iloc[-1]
     last_vol = df['Volume'].iloc[-1]
+    
+    # 1. 洗盤偵測
     wash_sale_msg = ""
     wash_detected = False
     recent_df = df.iloc[-20:-1] 
@@ -158,19 +170,73 @@ def generate_signals(df, high, low):
         if last_close >= key_low and last_vol < key_vol * 0.6:
             wash_detected = True
             wash_sale_msg = f"""<div class="wash-sale-alert">🌊 偵測到「主力洗盤」訊號！<br>1. 發動日：{key_date} (低點 {key_low:.1f})<br>2. 狀態：量縮守支撐</div>"""
-    
+
+    # 2. 斐波那契
     diff = high - low
     fib_levels = [low + diff*0.786, low + diff*0.618, low + diff*0.236]
-    pos_view = "🚨 誘多區" if last_close >= fib_levels[0] else ("⚠️ 高檔區" if last_close > fib_levels[1] else ("🟢 低檔區" if last_close < fib_levels[2] else "⚖️ 震盪區"))
-    return {"wash_detected": wash_detected, "wash_sale_msg": wash_sale_msg, "position": pos_view}
+    pos_view, pos_action = "", ""
+    if last_close >= fib_levels[0]:
+        pos_view = "🚨 價格進入 78.6%~88.6% 主力誘多獵殺區。"
+        pos_action = "嚴禁追高，隨時準備反轉做空或獲利了結。"
+    elif last_close > fib_levels[1]:
+        pos_view = "⚠️ 價格突破 61.8%，處於相對高檔。"
+        pos_action = "多單續抱，但需提高警覺。"
+    elif last_close < fib_levels[2]:
+        pos_view = "🟢 價格處於低檔底部區。"
+        pos_action = "分批佈局，尋找長線買點。"
+    else:
+        pos_view = "⚖️ 價格處於中間震盪區域。"
+        pos_action = "依照均線趨勢順勢操作。"
+
+    # 3. 布林通道
+    bb_upper = df['BB_Upper'].iloc[-1]
+    bb_view, bb_action = "", ""
+    if last_close > bb_upper:
+        bb_view = "🔥 股價衝破布林上軌，極短線過熱。"
+        bb_action = "不宜追價，考慮調節。"
+    else:
+        bb_view = "🌊 股價在布林通道內運行。"
+        bb_action = "觀望或區間操作。"
+
+    # 4. OBV
+    last_obv = df['OBV'].iloc[-1]
+    last_obv_ma = df['OBV_MA'].iloc[-1]
+    obv_view, obv_action = "", ""
+    if last_obv > last_obv_ma:
+        obv_view = "📈 OBV 位於均線之上，籌碼流入。"
+        obv_action = "主力心態偏多。"
+    else:
+        obv_view = "📉 OBV 位於均線之下，籌碼流出。"
+        obv_action = "主力心態保守。"
+
+    # 5. MACD
+    hist = df['MACD_Hist'].iloc[-1]
+    prev_hist = df['MACD_Hist'].iloc[-2]
+    macd_view, macd_action = "", ""
+    if hist > 0 and hist > prev_hist:
+        macd_view = "🚀 紅柱持續放大，動能強勁。"
+        macd_action = "積極操作。"
+    elif hist > 0 and hist < prev_hist:
+        macd_view = "⚠️ 紅柱縮短，背離警戒。"
+        macd_action = "設好停利。"
+    else:
+        macd_view = "✨ 多空膠著或空方控盤。"
+        macd_action = "保守應對。"
+
+    return {
+        "wash_detected": wash_detected, "wash_sale_msg": wash_sale_msg,
+        "position": (pos_view, pos_action),
+        "bollinger": (bb_view, bb_action),
+        "obv": (obv_view, obv_action),
+        "macd": (macd_view, macd_action)
+    }
 
 def get_live_prices(ticker_list):
     prices = {}
     if not ticker_list: return prices
     try:
         data = yf.download(ticker_list, period="1d", progress=False)['Close']
-        if len(ticker_list) == 1:
-            prices[ticker_list[0]] = data.iloc[-1]
+        if len(ticker_list) == 1: prices[ticker_list[0]] = data.iloc[-1]
         else:
             for t in ticker_list:
                 try: prices[t] = data[t].iloc[-1]
@@ -190,8 +256,9 @@ try:
         low_price = df['Low'].min()
         signals = generate_signals(df, high_price, low_price)
         
+        display_name_main = get_stock_display_name(ticker_symbol)
         title_col, tag_col = st.columns([3, 1])
-        with title_col: st.markdown(f"## 🏯 {selected_stock_name} 戰略指揮所")
+        with title_col: st.markdown(f"## 🏯 {display_name_main} 戰略指揮所")
         with tag_col:
             if signals['wash_detected']:
                 st.markdown('<div style="background:#e3f2fd; color:#0d47a1; padding:5px; border-radius:10px; text-align:center;">🌊 主力洗盤中</div>', unsafe_allow_html=True)
@@ -204,7 +271,6 @@ try:
             c2.metric("風險值 (VaR)", f"{var_95*100:.1f}%")
             c3.metric("高點", f"{high_price:.1f}")
             c4.metric("低點", f"{low_price:.1f}")
-            
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線', increasing_line_color='#ef4444', decreasing_line_color='#22c55e'), row=1, col=1)
             fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='MA20'), row=1, col=1)
@@ -213,10 +279,40 @@ try:
             fig.update_layout(height=600, showlegend=False, margin=dict(l=20, r=20, t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
+        # === Tab 2: 完整恢復 AI 報告 ===
         with tab2:
-            if signals['wash_detected']: st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
-            st.info(f"目前位階：{signals['position']}")
-            st.write("(詳細 AI 診斷請參閱前版)")
+            st.subheader("🤖 AI 首席分析師綜合診斷報告")
+            if signals['wash_detected']:
+                st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
+            else:
+                st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
+
+            # 這裡恢復了完整的 HTML 報告
+            report_html = f"""
+            <div class="report-box">
+                <div class="report-item">
+                    <span class="report-label">1. 戰略位階 (Fibonacci)：</span><br>
+                    觀點：<span class="report-view">{signals['position'][0]}</span><br>
+                    💡 建議：<span class="report-action">{signals['position'][1]}</span>
+                </div>
+                <div class="report-item">
+                    <span class="report-label">2. 波動風險 (Bollinger)：</span><br>
+                    觀點：<span class="report-view">{signals['bollinger'][0]}</span><br>
+                    💡 建議：<span class="report-action">{signals['bollinger'][1]}</span>
+                </div>
+                <div class="report-item">
+                    <span class="report-label">3. 籌碼流向 (OBV)：</span><br>
+                    觀點：<span class="report-view">{signals['obv'][0]}</span><br>
+                    💡 建議：<span class="report-action">{signals['obv'][1]}</span>
+                </div>
+                <div class="report-item">
+                    <span class="report-label">4. 市場動能 (MACD)：</span><br>
+                    觀點：<span class="report-view">{signals['macd'][0]}</span><br>
+                    💡 建議：<span class="report-action">{signals['macd'][1]}</span>
+                </div>
+            </div>
+            """
+            st.markdown(report_html, unsafe_allow_html=True)
 
         with tab3:
             try:
@@ -238,53 +334,40 @@ try:
         with tab4:
             st.subheader("💰 雲端庫存管理 (Google Sheets 同步)")
             portfolio_df = load_portfolio_gs()
-
             if not portfolio_df.empty:
                 edited_df = st.data_editor(
-                    portfolio_df,
-                    num_rows="dynamic",
+                    portfolio_df, num_rows="dynamic",
                     column_config={
                         "代號": st.column_config.TextColumn(help="請輸入完整代號，如 2330.TW"),
                         "買入均價": st.column_config.NumberColumn(format="$%.2f"),
-                        "持有股數": st.column_config.NumberColumn(format="%d"),
-                    },
-                    use_container_width=True,
-                    key="gs_editor"
+                        "持有股數": st.column_config.NumberColumn(format="%d")
+                    }, use_container_width=True, key="gs_editor"
                 )
-
                 c1, c2 = st.columns([1, 1])
                 with c1: save_btn = st.button("💾 儲存回 Google Sheets", type="primary")
-                with c2: calc_btn = st.button("🚀 僅計算損益 (不存檔)")
-
+                with c2: calc_btn = st.button("🚀 僅計算損益")
                 if save_btn:
                     save_portfolio_gs(edited_df)
-                    st.rerun() # 儲存後重新整理頁面，讓左側選單同步更新
-
+                    st.rerun()
                 if save_btn or calc_btn:
                     tickers = edited_df['代號'].astype(str).unique().tolist()
                     live_prices = get_live_prices(tickers)
                     res_df = edited_df.copy()
+                    res_df['名稱'] = res_df['代號'].apply(lambda x: get_stock_display_name(str(x)))
                     res_df['現價'] = res_df['代號'].map(live_prices).fillna(0)
                     res_df['市值'] = res_df['現價'] * res_df['持有股數']
                     res_df['成本'] = res_df['買入均價'] * res_df['持有股數']
                     res_df['損益'] = res_df['市值'] - res_df['成本']
                     res_df['報酬率%'] = ((res_df['損益'] / res_df['成本']) * 100).fillna(0)
-                    
                     total_val = res_df['市值'].sum()
                     total_pl = res_df['損益'].sum()
                     st.divider()
                     st.metric("總資產市值", f"${total_val:,.0f}", f"{total_pl:+,.0f}")
-                    
                     def color_pl(val):
                         color = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
                         return f'color: {color}; font-weight: bold'
-                    st.dataframe(
-                        res_df.style.map(color_pl, subset=['損益', '報酬率%'])
-                        .format({'現價':"{:.2f}", '市值':"{:,.0f}", '損益':"{:+,.0f}", '報酬率%':"{:+.2f}%"}),
-                        use_container_width=True
-                    )
-            else:
-                st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
-
-except Exception as e:
-    st.error(f"系統錯誤：{str(e)}")
+                    cols = ['代號', '名稱', '持有股數', '買入均價', '現價', '市值', '損益', '報酬率%']
+                    cols = [c for c in cols if c in res_df.columns]
+                    st.dataframe(res_df[cols].style.map(color_pl, subset=['損益', '報酬率%']).format({'現價':"{:.2f}", '市值':"{:,.0f}", '損益':"{:+,.0f}", '報酬率%':"{:+.2f}%"}), use_container_width=True)
+            else: st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
+except Exception as e: st.error(f"系統錯誤：{str(e)}")
