@@ -24,6 +24,9 @@ st.markdown("""
     .report-action { color: #d84315; font-weight: bold; }
     .wash-sale-alert { background-color: #e3f2fd; color: #0d47a1; padding: 15px; border-radius: 8px; border: 2px solid #0d47a1; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .dupont-tag { font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; background: #fff3e0; color: #e65100; border: 1px solid #e65100; }
+    /* 回測數據樣式 */
+    .backtest-metric { font-size: 1.2rem; font-weight: bold; color: #2e7d32; }
+    .backtest-loss { color: #d32f2f; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,7 +44,6 @@ SYMBOL_TO_NAME = {v: k for k, v in DEFAULT_STOCKS.items()}
 # --- 3. 輔助函數 ---
 @st.cache_data(ttl=86400)
 def get_stock_display_name(symbol):
-    # 先整理輸入 (轉大寫、去空白)
     symbol = symbol.upper().strip()
     if symbol in SYMBOL_TO_NAME: return SYMBOL_TO_NAME[symbol]
     try:
@@ -82,14 +84,61 @@ def save_portfolio_gs(df):
         st.success("✅ 資料已同步寫入 Google Sheets！")
     except Exception as e: st.error(f"寫入試算表失敗：{str(e)}")
 
-# --- 5. 側邊欄 (核心修改：新增搜尋框) ---
+# --- 5. 回測引擎 (核心新功能) ---
+def run_backtest(df, initial_capital=100000):
+    # 策略：MA5 黃金交叉 MA20 買進，死亡交叉賣出
+    df = df.copy()
+    df['Signal'] = 0
+    # 產生訊號：1=買, -1=賣
+    # 當 MA5 > MA20 且 前一天 MA5 < MA20 -> 黃金交叉 (買)
+    df.loc[(df['MA5'] > df['MA20']) & (df['MA5'].shift(1) <= df['MA20'].shift(1)), 'Signal'] = 1
+    # 當 MA5 < MA20 且 前一天 MA5 > MA20 -> 死亡交叉 (賣)
+    df.loc[(df['MA5'] < df['MA20']) & (df['MA5'].shift(1) >= df['MA20'].shift(1)), 'Signal'] = -1
+    
+    cash = initial_capital
+    position = 0 # 持有股數
+    trade_log = []
+    equity_curve = []
+    
+    for i in range(len(df)):
+        price = df['Close'].iloc[i]
+        date = df.index[i]
+        signal = df['Signal'].iloc[i]
+        
+        # 買進訊號 (且空手)
+        if signal == 1 and position == 0:
+            # 全倉買進 (簡單模擬)
+            position = int(cash // price)
+            cash -= position * price
+            trade_log.append({'Date': date, 'Type': 'Buy', 'Price': price, 'Shares': position})
+            
+        # 賣出訊號 (且有持股)
+        elif signal == -1 and position > 0:
+            cash += position * price
+            trade_log.append({'Date': date, 'Type': 'Sell', 'Price': price, 'Shares': position})
+            position = 0
+            
+        # 計算每日總資產
+        current_equity = cash + (position * price)
+        equity_curve.append(current_equity)
+        
+    df['Equity'] = equity_curve
+    
+    # 計算 KPI
+    total_return = (df['Equity'].iloc[-1] - initial_capital) / initial_capital * 100
+    trades_df = pd.DataFrame(trade_log)
+    win_rate = 0
+    if not trades_df.empty:
+        # 計算每筆交易盈虧
+        # 這裡簡化計算：只看賣出時的資產變化
+        pass # (實際盈虧需配對買賣，此處主要展示總回報)
+        
+    return df, total_return, trades_df
+
+# --- 6. 側邊欄 ---
 with st.sidebar:
     st.header("🏯 指揮中心")
-    
-    # 1. 搜尋框 (優先權最高)
     search_input = st.text_input("🔍 輸入代號搜尋 (Enter 確認)", placeholder="例如 2330.TW, NVDA")
-    
-    # 2. 下拉選單 (備用)
     final_options = {}
     try:
         my_portfolio = load_portfolio_gs()
@@ -100,7 +149,6 @@ with st.sidebar:
                     display_name = get_stock_display_name(stock_symbol)
                     final_options[f"💰 [庫存] {display_name}"] = stock_symbol
     except: pass
-    
     existing_symbols = list(final_options.values())
     for name, symbol in DEFAULT_STOCKS.items():
         if symbol not in existing_symbols: final_options[name] = symbol
@@ -108,31 +156,25 @@ with st.sidebar:
     if final_options:
         selected_stock_label = st.selectbox("📂 快速選單 (庫存/熱門)", list(final_options.keys()))
         selected_from_menu = final_options[selected_stock_label]
-    else:
-        selected_from_menu = "2330.TW"
+    else: selected_from_menu = "2330.TW"
 
-    # 3. 決定最終標的 (搜尋框有字就用搜尋框，否則用選單)
-    if search_input:
-        ticker_symbol = search_input.upper().strip()
-        st.caption("✨ 目前使用搜尋模式")
-    else:
-        ticker_symbol = selected_from_menu
+    if search_input: ticker_symbol = search_input.upper().strip()
+    else: ticker_symbol = selected_from_menu
 
     days_to_show = st.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
-    st.info("💡 提示：上市請加 .TW (如 2330.TW)，上櫃請加 .TWO (如 5347.TWO)，美股直接打代號 (如 NVDA)。")
+    st.info("💡 提示：上市請加 .TW，上櫃請加 .TWO，美股直接打代號。")
     if st.button("🔄 刷新數據"): st.cache_data.clear()
 
-# --- 6. 資料引擎 ---
+# --- 7. 資料引擎 ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days + 150)
-    # 防呆：如果代號輸入錯誤，這裡會報錯，我們用 try-except 包起來
+    # 回測需要更長的資料，這裡預設多抓 365 天供回測用，但顯示只顯示 days
+    fetch_start_date = end_date - timedelta(days=max(days + 150, 730)) 
     try:
-        data = yf.download(symbol, start=start_date, end=end_date, progress=False)
+        data = yf.download(symbol, start=fetch_start_date, end=end_date, progress=False)
         if data.empty: return pd.DataFrame(), 0
-        
         if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
         
         data['MA5'] = data['Close'].rolling(window=5).mean()
@@ -140,20 +182,19 @@ def load_data(symbol, days):
         data['STD20'] = data['Close'].rolling(window=20).std()
         data['BB_Upper'] = data['MA20'] + (2 * data['STD20'])
         data['BB_Lower'] = data['MA20'] - (2 * data['STD20'])
-        
         exp12 = data['Close'].ewm(span=12, adjust=False).mean()
         exp26 = data['Close'].ewm(span=26, adjust=False).mean()
         data['DIF'] = exp12 - exp26
         data['DEA'] = data['DIF'].ewm(span=9, adjust=False).mean()
         data['MACD_Hist'] = data['DIF'] - data['DEA']
-        
         data['OBV'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
         data['OBV_MA'] = data['OBV'].rolling(window=20).mean()
         data['Returns'] = data['Close'].pct_change()
         var_95 = data['Returns'].quantile(0.05)
-        return data.tail(days), var_95
-    except:
-        return pd.DataFrame(), 0
+        
+        # 回傳完整資料供回測，以及切片資料供繪圖
+        return data, var_95
+    except: return pd.DataFrame(), 0
 
 @st.cache_data(ttl=3600)
 def load_fundamentals(symbol):
@@ -171,8 +212,6 @@ def load_fundamentals(symbol):
 def generate_signals(df, high, low):
     last_close = df['Close'].iloc[-1]
     last_vol = df['Volume'].iloc[-1]
-    
-    # 1. 洗盤偵測
     wash_sale_msg = ""
     wash_detected = False
     recent_df = df.iloc[-20:-1] 
@@ -187,7 +226,6 @@ def generate_signals(df, high, low):
             wash_detected = True
             wash_sale_msg = f"""<div class="wash-sale-alert">🌊 偵測到「主力洗盤」訊號！<br>1. 發動日：{key_date} (低點 {key_low:.1f})<br>2. 狀態：量縮守支撐</div>"""
 
-    # 2. 斐波那契
     diff = high - low
     fib_levels = [low + diff*0.786, low + diff*0.618, low + diff*0.236]
     pos_view, pos_action = "", ""
@@ -203,48 +241,25 @@ def generate_signals(df, high, low):
     else:
         pos_view = "⚖️ 價格處於中間震盪區域。"
         pos_action = "依照均線趨勢順勢操作。"
-
-    # 3. 布林通道
+    
     bb_upper = df['BB_Upper'].iloc[-1]
-    bb_view, bb_action = "", ""
-    if last_close > bb_upper:
-        bb_view = "🔥 股價衝破布林上軌，極短線過熱。"
-        bb_action = "不宜追價，考慮調節。"
-    else:
-        bb_view = "🌊 股價在布林通道內運行。"
-        bb_action = "觀望或區間操作。"
-
-    # 4. OBV
+    bb_view = "🔥 股價衝破布林上軌，極短線過熱。" if last_close > bb_upper else "🌊 股價在布林通道內運行。"
+    bb_action = "不宜追價，考慮調節。" if last_close > bb_upper else "觀望或區間操作。"
+    
     last_obv = df['OBV'].iloc[-1]
     last_obv_ma = df['OBV_MA'].iloc[-1]
-    obv_view, obv_action = "", ""
-    if last_obv > last_obv_ma:
-        obv_view = "📈 OBV 位於均線之上，籌碼流入。"
-        obv_action = "主力心態偏多。"
-    else:
-        obv_view = "📉 OBV 位於均線之下，籌碼流出。"
-        obv_action = "主力心態保守。"
-
-    # 5. MACD
+    obv_view = "📈 OBV 位於均線之上，籌碼流入。" if last_obv > last_obv_ma else "📉 OBV 位於均線之下，籌碼流出。"
+    obv_action = "主力心態偏多。" if last_obv > last_obv_ma else "主力心態保守。"
+    
     hist = df['MACD_Hist'].iloc[-1]
     prev_hist = df['MACD_Hist'].iloc[-2]
-    macd_view, macd_action = "", ""
-    if hist > 0 and hist > prev_hist:
-        macd_view = "🚀 紅柱持續放大，動能強勁。"
-        macd_action = "積極操作。"
-    elif hist > 0 and hist < prev_hist:
-        macd_view = "⚠️ 紅柱縮短，背離警戒。"
-        macd_action = "設好停利。"
-    else:
-        macd_view = "✨ 多空膠著或空方控盤。"
-        macd_action = "保守應對。"
+    macd_view = "🚀 紅柱持續放大，動能強勁。" if hist > 0 and hist > prev_hist else ("⚠️ 紅柱縮短，背離警戒。" if hist > 0 and hist < prev_hist else "✨ 多空膠著或空方控盤。")
+    macd_action = "積極操作。" if hist > 0 and hist > prev_hist else ("設好停利。" if hist > 0 and hist < prev_hist else "保守應對。")
 
     return {
         "wash_detected": wash_detected, "wash_sale_msg": wash_sale_msg,
-        "position": (pos_view, pos_action),
-        "bollinger": (bb_view, bb_action),
-        "obv": (obv_view, obv_action),
-        "macd": (macd_view, macd_action)
+        "position": (pos_view, pos_action), "bollinger": (bb_view, bb_action),
+        "obv": (obv_view, obv_action), "macd": (macd_view, macd_action)
     }
 
 def get_live_prices(ticker_list):
@@ -262,10 +277,14 @@ def get_live_prices(ticker_list):
 
 # --- 主畫面 ---
 try:
-    df, var_95 = load_data(ticker_symbol, days_to_show)
-    if df.empty:
-        st.error(f"❌ 無法取得數據：{ticker_symbol}。請確認代號是否正確 (上市加 .TW, 上櫃加 .TWO)。")
+    full_df, var_95 = load_data(ticker_symbol, days_to_show)
+    
+    if full_df.empty:
+        st.error(f"❌ 無法取得數據：{ticker_symbol}。請確認代號是否正確。")
     else:
+        # 繪圖只取最近 N 天
+        df = full_df.tail(days_to_show)
+        
         last_close = df['Close'].iloc[-1]
         pct_change = df['Returns'].iloc[-1] * 100
         high_price = df['High'].max()
@@ -279,7 +298,7 @@ try:
             if signals['wash_detected']:
                 st.markdown('<div style="background:#e3f2fd; color:#0d47a1; padding:5px; border-radius:10px; text-align:center;">🌊 主力洗盤中</div>', unsafe_allow_html=True)
         
-        tab1, tab2, tab3, tab4 = st.tabs(["📈 技術戰情室", "🤖 AI 策略雷達", "📊 基本面體檢", "💰 我的庫存管理"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 技術戰情室", "🤖 AI 策略雷達", "📊 基本面體檢", "💰 我的庫存管理", "🧪 策略實驗室"])
 
         with tab1:
             c1, c2, c3, c4 = st.columns(4)
@@ -297,59 +316,5 @@ try:
 
         with tab2:
             st.subheader("🤖 AI 首席分析師綜合診斷報告")
-            if signals['wash_detected']:
-                st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
-            else:
-                st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
-
-            report_html = f"""
-            <div class="report-box">
-                <div class="report-item">
-                    <span class="report-label">1. 戰略位階 (Fibonacci)：</span><br>
-                    觀點：<span class="report-view">{signals['position'][0]}</span><br>
-                    💡 建議：<span class="report-action">{signals['position'][1]}</span>
-                </div>
-                <div class="report-item">
-                    <span class="report-label">2. 波動風險 (Bollinger)：</span><br>
-                    觀點：<span class="report-view">{signals['bollinger'][0]}</span><br>
-                    💡 建議：<span class="report-action">{signals['bollinger'][1]}</span>
-                </div>
-                <div class="report-item">
-                    <span class="report-label">3. 籌碼流向 (OBV)：</span><br>
-                    觀點：<span class="report-view">{signals['obv'][0]}</span><br>
-                    💡 建議：<span class="report-action">{signals['obv'][1]}</span>
-                </div>
-                <div class="report-item">
-                    <span class="report-label">4. 市場動能 (MACD)：</span><br>
-                    觀點：<span class="report-view">{signals['macd'][0]}</span><br>
-                    💡 建議：<span class="report-action">{signals['macd'][1]}</span>
-                </div>
-            </div>
-            """
-            st.markdown(report_html, unsafe_allow_html=True)
-
-        with tab3:
-            try:
-                with st.spinner('分析財報中...'):
-                    info, bs, is_stmt = load_fundamentals(ticker_symbol)
-                    pe = info.get('trailingPE', 0)
-                    try: rev = is_stmt.loc['Total Revenue'].iloc[0]
-                    except: rev = info.get('totalRevenue', 0)
-                    try: net = is_stmt.loc['Net Income'].iloc[0]
-                    except: net = rev * info.get('profitMargins', 0)
-                    try: equity = bs.loc['Stockholders Equity'].iloc[0]
-                    except: equity = info.get('totalStockholderEquity', 0)
-                    roe = net / equity if equity else 0
-                    m1, m2 = st.columns(2)
-                    m1.metric("本益比 (PE)", f"{pe:.1f}" if pe else "N/A")
-                    m2.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
-                    
-                    st.divider()
-                    st.subheader("📐 杜邦分析 (DuPont Analysis)")
-                    
-                    # 重新計算杜邦三元素
-                    try: assets = bs.loc['Total Assets'].iloc[0]
-                    except: assets = info.get('totalAssets', 0)
-                    
-                    net_margin = net / rev if rev else 0
-                    asset_turnover = rev / assets if assets else
+            if signals['wash_detected']: st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
+            else: st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
