@@ -24,7 +24,6 @@ st.markdown("""
     .report-action { color: #d84315; font-weight: bold; }
     .wash-sale-alert { background-color: #e3f2fd; color: #0d47a1; padding: 15px; border-radius: 8px; border: 2px solid #0d47a1; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .dupont-tag { font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; background: #fff3e0; color: #e65100; border: 1px solid #e65100; }
-    /* 回測數據樣式 */
     .backtest-metric { font-size: 1.2rem; font-weight: bold; color: #2e7d32; }
     .backtest-loss { color: #d32f2f; }
 </style>
@@ -45,12 +44,14 @@ SYMBOL_TO_NAME = {v: k for k, v in DEFAULT_STOCKS.items()}
 @st.cache_data(ttl=86400)
 def get_stock_display_name(symbol):
     symbol = symbol.upper().strip()
-    if symbol in SYMBOL_TO_NAME: return SYMBOL_TO_NAME[symbol]
+    if symbol in SYMBOL_TO_NAME:
+        return SYMBOL_TO_NAME[symbol]
     try:
         t = yf.Ticker(symbol)
         name = t.info.get('shortName') or t.info.get('longName') or symbol
         return f"{name} ({symbol.replace('.TW', '').replace('.TWO', '')})"
-    except: return symbol
+    except:
+        return symbol
 
 # --- 4. Google Sheets 連線 ---
 SHEET_NAME = "我的持股庫存"
@@ -62,41 +63,43 @@ def get_gspread_client():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
-    except: return None
+    except:
+        return None
 
 def load_portfolio_gs():
     client = get_gspread_client()
-    if not client: return pd.DataFrame()
+    if not client:
+        return pd.DataFrame()
     try:
         sheet = client.open(SHEET_NAME).sheet1
         data = sheet.get_all_records()
-        if not data: return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
+        if not data:
+            return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
         return pd.DataFrame(data)
-    except: return pd.DataFrame()
+    except:
+        return pd.DataFrame()
 
 def save_portfolio_gs(df):
     client = get_gspread_client()
-    if not client: return
+    if not client:
+        return
     try:
         sheet = client.open(SHEET_NAME).sheet1
         sheet.clear()
         sheet.update([df.columns.values.tolist()] + df.values.tolist())
         st.success("✅ 資料已同步寫入 Google Sheets！")
-    except Exception as e: st.error(f"寫入試算表失敗：{str(e)}")
+    except Exception as e:
+        st.error(f"寫入試算表失敗：{str(e)}")
 
-# --- 5. 回測引擎 (核心新功能) ---
+# --- 5. 回測引擎 ---
 def run_backtest(df, initial_capital=100000):
-    # 策略：MA5 黃金交叉 MA20 買進，死亡交叉賣出
     df = df.copy()
     df['Signal'] = 0
-    # 產生訊號：1=買, -1=賣
-    # 當 MA5 > MA20 且 前一天 MA5 < MA20 -> 黃金交叉 (買)
     df.loc[(df['MA5'] > df['MA20']) & (df['MA5'].shift(1) <= df['MA20'].shift(1)), 'Signal'] = 1
-    # 當 MA5 < MA20 且 前一天 MA5 > MA20 -> 死亡交叉 (賣)
     df.loc[(df['MA5'] < df['MA20']) & (df['MA5'].shift(1) >= df['MA20'].shift(1)), 'Signal'] = -1
     
     cash = initial_capital
-    position = 0 # 持有股數
+    position = 0
     trade_log = []
     equity_curve = []
     
@@ -105,34 +108,22 @@ def run_backtest(df, initial_capital=100000):
         date = df.index[i]
         signal = df['Signal'].iloc[i]
         
-        # 買進訊號 (且空手)
         if signal == 1 and position == 0:
-            # 全倉買進 (簡單模擬)
             position = int(cash // price)
             cash -= position * price
             trade_log.append({'Date': date, 'Type': 'Buy', 'Price': price, 'Shares': position})
             
-        # 賣出訊號 (且有持股)
         elif signal == -1 and position > 0:
             cash += position * price
             trade_log.append({'Date': date, 'Type': 'Sell', 'Price': price, 'Shares': position})
             position = 0
             
-        # 計算每日總資產
         current_equity = cash + (position * price)
         equity_curve.append(current_equity)
         
     df['Equity'] = equity_curve
-    
-    # 計算 KPI
     total_return = (df['Equity'].iloc[-1] - initial_capital) / initial_capital * 100
     trades_df = pd.DataFrame(trade_log)
-    win_rate = 0
-    if not trades_df.empty:
-        # 計算每筆交易盈虧
-        # 這裡簡化計算：只看賣出時的資產變化
-        pass # (實際盈虧需配對買賣，此處主要展示總回報)
-        
     return df, total_return, trades_df
 
 # --- 6. 側邊欄 ---
@@ -140,6 +131,7 @@ with st.sidebar:
     st.header("🏯 指揮中心")
     search_input = st.text_input("🔍 輸入代號搜尋 (Enter 確認)", placeholder="例如 2330.TW, NVDA")
     final_options = {}
+    
     try:
         my_portfolio = load_portfolio_gs()
         if not my_portfolio.empty and '代號' in my_portfolio.columns:
@@ -148,34 +140,42 @@ with st.sidebar:
                 if stock_symbol and stock_symbol.strip():
                     display_name = get_stock_display_name(stock_symbol)
                     final_options[f"💰 [庫存] {display_name}"] = stock_symbol
-    except: pass
+    except:
+        pass
+    
     existing_symbols = list(final_options.values())
     for name, symbol in DEFAULT_STOCKS.items():
-        if symbol not in existing_symbols: final_options[name] = symbol
+        if symbol not in existing_symbols:
+            final_options[name] = symbol
     
     if final_options:
         selected_stock_label = st.selectbox("📂 快速選單 (庫存/熱門)", list(final_options.keys()))
         selected_from_menu = final_options[selected_stock_label]
-    else: selected_from_menu = "2330.TW"
+    else:
+        selected_from_menu = "2330.TW"
 
-    if search_input: ticker_symbol = search_input.upper().strip()
-    else: ticker_symbol = selected_from_menu
+    if search_input:
+        ticker_symbol = search_input.upper().strip()
+    else:
+        ticker_symbol = selected_from_menu
 
     days_to_show = st.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
     st.info("💡 提示：上市請加 .TW，上櫃請加 .TWO，美股直接打代號。")
-    if st.button("🔄 刷新數據"): st.cache_data.clear()
+    if st.button("🔄 刷新數據"):
+        st.cache_data.clear()
 
 # --- 7. 資料引擎 ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
-    # 回測需要更長的資料，這裡預設多抓 365 天供回測用，但顯示只顯示 days
-    fetch_start_date = end_date - timedelta(days=max(days + 150, 730)) 
+    fetch_start_date = end_date - timedelta(days=max(days + 150, 730))
     try:
         data = yf.download(symbol, start=fetch_start_date, end=end_date, progress=False)
-        if data.empty: return pd.DataFrame(), 0
-        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            return pd.DataFrame(), 0
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         
         data['MA5'] = data['Close'].rolling(window=5).mean()
         data['MA20'] = data['Close'].rolling(window=20).mean()
@@ -191,10 +191,9 @@ def load_data(symbol, days):
         data['OBV_MA'] = data['OBV'].rolling(window=20).mean()
         data['Returns'] = data['Close'].pct_change()
         var_95 = data['Returns'].quantile(0.05)
-        
-        # 回傳完整資料供回測，以及切片資料供繪圖
         return data, var_95
-    except: return pd.DataFrame(), 0
+    except:
+        return pd.DataFrame(), 0
 
 @st.cache_data(ttl=3600)
 def load_fundamentals(symbol):
@@ -264,15 +263,20 @@ def generate_signals(df, high, low):
 
 def get_live_prices(ticker_list):
     prices = {}
-    if not ticker_list: return prices
+    if not ticker_list:
+        return prices
     try:
         data = yf.download(ticker_list, period="1d", progress=False)['Close']
-        if len(ticker_list) == 1: prices[ticker_list[0]] = data.iloc[-1]
+        if len(ticker_list) == 1:
+            prices[ticker_list[0]] = data.iloc[-1]
         else:
             for t in ticker_list:
-                try: prices[t] = data[t].iloc[-1]
-                except: prices[t] = 0
-    except: pass
+                try:
+                    prices[t] = data[t].iloc[-1]
+                except:
+                    prices[t] = 0
+    except:
+        pass
     return prices
 
 # --- 主畫面 ---
@@ -282,7 +286,6 @@ try:
     if full_df.empty:
         st.error(f"❌ 無法取得數據：{ticker_symbol}。請確認代號是否正確。")
     else:
-        # 繪圖只取最近 N 天
         df = full_df.tail(days_to_show)
         
         last_close = df['Close'].iloc[-1]
@@ -293,7 +296,8 @@ try:
         
         display_name_main = get_stock_display_name(ticker_symbol)
         title_col, tag_col = st.columns([3, 1])
-        with title_col: st.markdown(f"## 🏯 {display_name_main} 戰略指揮所")
+        with title_col:
+            st.markdown(f"## 🏯 {display_name_main} 戰略指揮所")
         with tag_col:
             if signals['wash_detected']:
                 st.markdown('<div style="background:#e3f2fd; color:#0d47a1; padding:5px; border-radius:10px; text-align:center;">🌊 主力洗盤中</div>', unsafe_allow_html=True)
@@ -316,5 +320,101 @@ try:
 
         with tab2:
             st.subheader("🤖 AI 首席分析師綜合診斷報告")
-            if signals['wash_detected']: st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
-            else: st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
+            
+            # --- 修復重點：這裡使用標準多行寫法 ---
+            if signals['wash_detected']:
+                st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
+            else:
+                st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
+            # -----------------------------------
+
+            report_html = f"""<div class="report-box">
+                <div class="report-item"><span class="report-label">1. 戰略位階 (Fibonacci)：</span><br>觀點：<span class="report-view">{signals['position'][0]}</span><br>💡 建議：<span class="report-action">{signals['position'][1]}</span></div>
+                <div class="report-item"><span class="report-label">2. 波動風險 (Bollinger)：</span><br>觀點：<span class="report-view">{signals['bollinger'][0]}</span><br>💡 建議：<span class="report-action">{signals['bollinger'][1]}</span></div>
+                <div class="report-item"><span class="report-label">3. 籌碼流向 (OBV)：</span><br>觀點：<span class="report-view">{signals['obv'][0]}</span><br>💡 建議：<span class="report-action">{signals['obv'][1]}</span></div>
+                <div class="report-item"><span class="report-label">4. 市場動能 (MACD)：</span><br>觀點：<span class="report-view">{signals['macd'][0]}</span><br>💡 建議：<span class="report-action">{signals['macd'][1]}</span></div>
+            </div>"""
+            st.markdown(report_html, unsafe_allow_html=True)
+
+        with tab3:
+            try:
+                with st.spinner('分析財報中...'):
+                    info, bs, is_stmt = load_fundamentals(ticker_symbol)
+                    pe = info.get('trailingPE', 0)
+                    try: rev = is_stmt.loc['Total Revenue'].iloc[0]
+                    except: rev = info.get('totalRevenue', 0)
+                    try: net = is_stmt.loc['Net Income'].iloc[0]
+                    except: net = rev * info.get('profitMargins', 0)
+                    try: equity = bs.loc['Stockholders Equity'].iloc[0]
+                    except: equity = info.get('totalStockholderEquity', 0)
+                    roe = net / equity if equity else 0
+                    m1, m2 = st.columns(2)
+                    m1.metric("本益比 (PE)", f"{pe:.1f}" if pe else "N/A")
+                    m2.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
+                    st.divider()
+                    st.subheader("📐 杜邦分析")
+                    try: assets = bs.loc['Total Assets'].iloc[0]
+                    except: assets = info.get('totalAssets', 0)
+                    net_margin = net / rev if rev else 0
+                    asset_turnover = rev / assets if assets else 0
+                    equity_multiplier = assets / equity if equity else 0
+                    d1, d2, d3, d4 = st.columns(4)
+                    d1.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
+                    d2.metric("純益率", f"{net_margin*100:.2f}%" if net_margin else "N/A")
+                    d3.metric("總資產週轉率", f"{asset_turnover:.2f} 次" if asset_turnover else "N/A")
+                    d4.metric("權益乘數", f"{equity_multiplier:.2f} 倍" if equity_multiplier else "N/A")
+            except:
+                st.warning("此標的無財務數據 (可能是 ETF 或 資料缺失)")
+
+        with tab4:
+            st.subheader("💰 雲端庫存管理 (Google Sheets 同步)")
+            portfolio_df = load_portfolio_gs()
+            if not portfolio_df.empty:
+                edited_df = st.data_editor(portfolio_df, num_rows="dynamic", column_config={"代號": st.column_config.TextColumn(help="請輸入完整代號"),"買入均價": st.column_config.NumberColumn(format="$%.2f"),"持有股數": st.column_config.NumberColumn(format="%d")}, use_container_width=True, key="gs_editor")
+                c1, c2 = st.columns([1, 1])
+                with c1: save_btn = st.button("💾 儲存回 Google Sheets", type="primary")
+                with c2: calc_btn = st.button("🚀 僅計算損益")
+                if save_btn:
+                    save_portfolio_gs(edited_df)
+                    st.rerun()
+                if save_btn or calc_btn:
+                    tickers = edited_df['代號'].astype(str).unique().tolist()
+                    live_prices = get_live_prices(tickers)
+                    res_df = edited_df.copy()
+                    res_df['名稱'] = res_df['代號'].apply(lambda x: get_stock_display_name(str(x)))
+                    res_df['現價'] = res_df['代號'].map(live_prices).fillna(0)
+                    res_df['市值'] = res_df['現價'] * res_df['持有股數']
+                    res_df['成本'] = res_df['買入均價'] * res_df['持有股數']
+                    res_df['損益'] = res_df['市值'] - res_df['成本']
+                    res_df['報酬率%'] = ((res_df['損益'] / res_df['成本']) * 100).fillna(0)
+                    total_val = res_df['市值'].sum()
+                    total_pl = res_df['損益'].sum()
+                    st.divider()
+                    st.metric("總資產市值", f"${total_val:,.0f}", f"{total_pl:+,.0f}")
+                    def color_pl(val): return f'color: {"#d32f2f" if val > 0 else "#2e7d32" if val < 0 else "black"}; font-weight: bold'
+                    st.dataframe(res_df.style.map(color_pl, subset=['損益', '報酬率%']).format({'現價':"{:.2f}", '市值':"{:,.0f}", '損益':"{:+,.0f}", '報酬率%':"{:+.2f}%"}), use_container_width=True)
+            else:
+                st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
+            
+        with tab5:
+            st.subheader("🧪 策略回測實驗室")
+            st.caption("策略邏輯：當 MA5 向上突破 MA20 時買進 (黃金交叉)，向下跌破 MA20 時賣出 (死亡交叉)。初始資金 10 萬元。")
+            bt_df, bt_return, trade_log = run_backtest(full_df)
+            b1, b2, b3 = st.columns(3)
+            b1.metric("回測期間總報酬率", f"{bt_return:.2f}%", delta_color="normal")
+            b2.metric("總交易次數", f"{len(trade_log)} 次")
+            if bt_return > 0: b3.success("✅ 策略驗證：此策略在此期間獲利！")
+            else: b3.error("❌ 策略驗證：此策略在此期間虧損。")
+            st.divider()
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(x=bt_df.index, y=bt_df['Equity'], mode='lines', name='總資產變化', line=dict(color='#1a237e', width=2)))
+            fig_bt.update_layout(title="資產成長曲線 (Equity Curve)", height=400, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_bt, use_container_width=True)
+            if not trade_log.empty:
+                st.write("📜 交易明細")
+                st.dataframe(trade_log, use_container_width=True)
+            else:
+                st.info("此期間無交易訊號触发。")
+
+except Exception as e:
+    st.error(f"系統錯誤：{str(e)}")
