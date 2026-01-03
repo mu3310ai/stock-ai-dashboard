@@ -6,9 +6,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import io
+import requests # 新增：用於建立偽裝請求
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import twstock # 新增：台灣在地股票資訊庫
+import twstock
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="台股全方位指揮所", layout="wide", page_icon="🏯")
@@ -41,40 +42,23 @@ DEFAULT_STOCKS = {
 }
 SYMBOL_TO_NAME = {v: k for k, v in DEFAULT_STOCKS.items()}
 
-# --- 3. 智能名稱辨識系統 (核心升級) ---
+# --- 3. 智能名稱辨識系統 ---
 @st.cache_data(ttl=86400)
 def get_stock_display_name(symbol):
-    """
-    超級名稱解析器 v18.0：
-    1. 先查手動字典 (最快)
-    2. 如果是台股 (數字開頭)，用 twstock 查中文名 (最準)
-    3. 如果是美股，用 yfinance 查英文名
-    """
     symbol = symbol.upper().strip()
-    
-    # 1. 查手動字典
-    if symbol in SYMBOL_TO_NAME:
-        return SYMBOL_TO_NAME[symbol]
-    
-    # 2. 嘗試解析台股代碼 (例如 5478.TWO -> 5478)
+    if symbol in SYMBOL_TO_NAME: return SYMBOL_TO_NAME[symbol]
     pure_code = symbol.split('.')[0]
-    
-    # 如果是數字開頭，極高機率是台股，召喚 twstock
     if pure_code.isdigit():
         try:
             if pure_code in twstock.codes:
                 stock_info = twstock.codes[pure_code]
                 return f"{stock_info.name} ({pure_code})"
-        except:
-            pass # 查不到就算了，往下走
-            
-    # 3. 最後一招：問 Yahoo
+        except: pass
     try:
         t = yf.Ticker(symbol)
         name = t.info.get('shortName') or t.info.get('longName') or symbol
         return f"{name} ({symbol.replace('.TW', '').replace('.TWO', '')})"
-    except:
-        return symbol
+    except: return symbol
 
 # --- 4. Google Sheets 連線 ---
 SHEET_NAME = "我的持股庫存"
@@ -154,21 +138,18 @@ with st.sidebar:
     existing_symbols = list(final_options.values())
     for name, symbol in DEFAULT_STOCKS.items():
         if symbol not in existing_symbols: final_options[name] = symbol
-    
     if final_options:
         selected_stock_label = st.selectbox("📂 快速選單 (庫存/熱門)", list(final_options.keys()))
         selected_from_menu = final_options[selected_stock_label]
     else: selected_from_menu = "2330.TW"
-
     if search_input: ticker_symbol = search_input.upper().strip()
     else: ticker_symbol = selected_from_menu
-
     days_to_show = st.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
     st.info("💡 提示：上市請加 .TW，上櫃請加 .TWO (例如 5478.TWO)，美股直接打代號。")
     if st.button("🔄 刷新數據"): st.cache_data.clear()
 
-# --- 7. 資料引擎 ---
+# --- 7. 資料引擎 (技術面) ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
@@ -194,32 +175,53 @@ def load_data(symbol, days):
         return data, var_95
     except: return pd.DataFrame(), 0
 
-# --- 8. 資料引擎 (基本面 - 強效修復版) ---
+# --- 8. 資料引擎 (基本面 - 隱形戰機版) ---
 @st.cache_data(ttl=3600)
 def load_fundamentals_robust(symbol):
+    """
+    使用偽裝 Session 來繞過 Yahoo 的反爬蟲機制
+    """
     try:
-        ticker = yf.Ticker(symbol)
+        # 建立一個偽裝的 Session
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+
+        # 傳入 session 給 Ticker
+        ticker = yf.Ticker(symbol, session=session)
+        
+        # 1. 嘗試獲取 info
         info = ticker.info
+        
+        # 2. 如果 info 是空的或抓不到 key，代表可能還是被擋，嘗試用 fast_info (備案)
+        if not info or len(info) < 5:
+            # 這裡可以加入更多備案邏輯，但通常 Session 加上去後就會正常
+            pass
+
         pe = info.get('trailingPE')
         roe = info.get('returnOnEquity')
-        profit_margin = info.get('profitMargins')
-        net_margin_val = profit_margin
+        net_margin_val = info.get('profitMargins')
         total_revenue = info.get('totalRevenue')
         total_assets = info.get('totalAssets')
         total_equity = info.get('totalStockholderEquity')
+
+        # 備案：如果 info 缺東缺西，嘗試從 balance sheet 補
         if total_assets is None or total_equity is None:
              bs = ticker.balance_sheet
              if not bs.empty:
                  for key in ['Total Assets', 'Assets', 'TotalAssets']:
-                     if key in bs.index:
-                         total_assets = bs.loc[key].iloc[0]; break
+                     if key in bs.index: total_assets = bs.loc[key].iloc[0]; break
                  for key in ['Stockholders Equity', 'Total Stockholder Equity', 'TotalStockholderEquity']:
-                     if key in bs.index:
-                         total_equity = bs.loc[key].iloc[0]; break
+                     if key in bs.index: total_equity = bs.loc[key].iloc[0]; break
+        
         asset_turnover_val = total_revenue / total_assets if (total_revenue and total_assets) else None
         equity_multiplier_val = total_assets / total_equity if (total_assets and total_equity) else None
+        
         return {'PE': pe, 'ROE': roe, 'NetMargin': net_margin_val, 'AssetTurnover': asset_turnover_val, 'EquityMultiplier': equity_multiplier_val}
-    except: return {}
+    except Exception as e:
+        print(f"Debug Info: {e}")
+        return {}
 
 def generate_signals(df, high, low):
     last_close = df['Close'].iloc[-1]
