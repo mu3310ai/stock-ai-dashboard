@@ -165,7 +165,7 @@ with st.sidebar:
     if st.button("🔄 刷新數據"):
         st.cache_data.clear()
 
-# --- 7. 資料引擎 ---
+# --- 7. 資料引擎 (技術面) ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
@@ -195,18 +195,69 @@ def load_data(symbol, days):
     except:
         return pd.DataFrame(), 0
 
+# --- 8. 資料引擎 (基本面 - 強效修復版) ---
 @st.cache_data(ttl=3600)
-def load_fundamentals(symbol):
+def load_fundamentals_robust(symbol):
+    """
+    強效版基本面讀取：優先使用 info (預計算值)，失敗才嘗試財報表格。
+    """
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
-        bs = ticker.balance_sheet
-        is_stmt = ticker.income_stmt
-    except:
-        info = {}
-        bs = pd.DataFrame()
-        is_stmt = pd.DataFrame()
-    return info, bs, is_stmt
+        
+        # 1. 嘗試直接從 info 獲取數據 (最穩)
+        pe = info.get('trailingPE')
+        roe = info.get('returnOnEquity')
+        profit_margin = info.get('profitMargins')
+        
+        # 杜邦分析需要的三個因子
+        # 淨利率 (Net Profit Margin)
+        net_margin_val = profit_margin # 這裡直接用 info 的
+        
+        # 總資產週轉率 (Asset Turnover) = 營收 / 總資產
+        # 嘗試從 info 抓
+        total_revenue = info.get('totalRevenue')
+        total_assets = info.get('totalAssets')
+        
+        # 權益乘數 (Equity Multiplier) = 總資產 / 股東權益
+        total_equity = info.get('totalStockholderEquity')
+        
+        # 如果 info 裡缺資料，嘗試備用計算 (針對某些台股)
+        if total_assets is None or total_equity is None:
+             # 嘗試讀取 Balance Sheet
+             bs = ticker.balance_sheet
+             if not bs.empty:
+                 # 模糊搜尋：嘗試多種可能的欄位名稱
+                 for key in ['Total Assets', 'Assets', 'TotalAssets']:
+                     if key in bs.index:
+                         total_assets = bs.loc[key].iloc[0]
+                         break
+                 
+                 for key in ['Stockholders Equity', 'Total Stockholder Equity', 'TotalStockholderEquity']:
+                     if key in bs.index:
+                         total_equity = bs.loc[key].iloc[0]
+                         break
+                         
+        # 計算衍生指標
+        asset_turnover_val = None
+        if total_revenue and total_assets:
+            asset_turnover_val = total_revenue / total_assets
+            
+        equity_multiplier_val = None
+        if total_assets and total_equity:
+            equity_multiplier_val = total_assets / total_equity
+            
+        return {
+            'PE': pe,
+            'ROE': roe,
+            'NetMargin': net_margin_val,
+            'AssetTurnover': asset_turnover_val,
+            'EquityMultiplier': equity_multiplier_val
+        }
+
+    except Exception as e:
+        print(f"Fundamental Error: {e}")
+        return {}
 
 def generate_signals(df, high, low):
     last_close = df['Close'].iloc[-1]
@@ -320,13 +371,10 @@ try:
 
         with tab2:
             st.subheader("🤖 AI 首席分析師綜合診斷報告")
-            
-            # --- 修復重點：這裡使用標準多行寫法 ---
             if signals['wash_detected']:
                 st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
             else:
                 st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
-            # -----------------------------------
 
             report_html = f"""<div class="report-box">
                 <div class="report-item"><span class="report-label">1. 戰略位階 (Fibonacci)：</span><br>觀點：<span class="report-view">{signals['position'][0]}</span><br>💡 建議：<span class="report-action">{signals['position'][1]}</span></div>
@@ -337,34 +385,31 @@ try:
             st.markdown(report_html, unsafe_allow_html=True)
 
         with tab3:
-            try:
-                with st.spinner('分析財報中...'):
-                    info, bs, is_stmt = load_fundamentals(ticker_symbol)
-                    pe = info.get('trailingPE', 0)
-                    try: rev = is_stmt.loc['Total Revenue'].iloc[0]
-                    except: rev = info.get('totalRevenue', 0)
-                    try: net = is_stmt.loc['Net Income'].iloc[0]
-                    except: net = rev * info.get('profitMargins', 0)
-                    try: equity = bs.loc['Stockholders Equity'].iloc[0]
-                    except: equity = info.get('totalStockholderEquity', 0)
-                    roe = net / equity if equity else 0
+            with st.spinner('分析財報數據中...'):
+                fund_data = load_fundamentals_robust(ticker_symbol)
+                
+                # 解包數據
+                pe = fund_data.get('PE')
+                roe = fund_data.get('ROE')
+                net_margin = fund_data.get('NetMargin')
+                asset_turnover = fund_data.get('AssetTurnover')
+                equity_multiplier = fund_data.get('EquityMultiplier')
+                
+                if not fund_data:
+                    st.warning("⚠️ 此標的無詳細財報數據 (可能是 ETF 或 資料源暫時無法存取)")
+                else:
                     m1, m2 = st.columns(2)
                     m1.metric("本益比 (PE)", f"{pe:.1f}" if pe else "N/A")
-                    m2.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
+                    m2.metric("ROE (權益報酬率)", f"{roe*100:.2f}%" if roe else "N/A")
+                    
                     st.divider()
-                    st.subheader("📐 杜邦分析")
-                    try: assets = bs.loc['Total Assets'].iloc[0]
-                    except: assets = info.get('totalAssets', 0)
-                    net_margin = net / rev if rev else 0
-                    asset_turnover = rev / assets if assets else 0
-                    equity_multiplier = assets / equity if equity else 0
+                    st.subheader("📐 杜邦分析 (DuPont Analysis)")
+                    
                     d1, d2, d3, d4 = st.columns(4)
                     d1.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
                     d2.metric("純益率", f"{net_margin*100:.2f}%" if net_margin else "N/A")
                     d3.metric("總資產週轉率", f"{asset_turnover:.2f} 次" if asset_turnover else "N/A")
                     d4.metric("權益乘數", f"{equity_multiplier:.2f} 倍" if equity_multiplier else "N/A")
-            except:
-                st.warning("此標的無財務數據 (可能是 ETF 或 資料缺失)")
 
         with tab4:
             st.subheader("💰 雲端庫存管理 (Google Sheets 同步)")
