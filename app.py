@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import io
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import twstock # 新增：台灣在地股票資訊庫
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="台股全方位指揮所", layout="wide", page_icon="🏯")
@@ -40,12 +41,34 @@ DEFAULT_STOCKS = {
 }
 SYMBOL_TO_NAME = {v: k for k, v in DEFAULT_STOCKS.items()}
 
-# --- 3. 輔助函數 ---
+# --- 3. 智能名稱辨識系統 (核心升級) ---
 @st.cache_data(ttl=86400)
 def get_stock_display_name(symbol):
+    """
+    超級名稱解析器 v18.0：
+    1. 先查手動字典 (最快)
+    2. 如果是台股 (數字開頭)，用 twstock 查中文名 (最準)
+    3. 如果是美股，用 yfinance 查英文名
+    """
     symbol = symbol.upper().strip()
+    
+    # 1. 查手動字典
     if symbol in SYMBOL_TO_NAME:
         return SYMBOL_TO_NAME[symbol]
+    
+    # 2. 嘗試解析台股代碼 (例如 5478.TWO -> 5478)
+    pure_code = symbol.split('.')[0]
+    
+    # 如果是數字開頭，極高機率是台股，召喚 twstock
+    if pure_code.isdigit():
+        try:
+            if pure_code in twstock.codes:
+                stock_info = twstock.codes[pure_code]
+                return f"{stock_info.name} ({pure_code})"
+        except:
+            pass # 查不到就算了，往下走
+            
+    # 3. 最後一招：問 Yahoo
     try:
         t = yf.Ticker(symbol)
         name = t.info.get('shortName') or t.info.get('longName') or symbol
@@ -63,33 +86,27 @@ def get_gspread_client():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
-    except:
-        return None
+    except: return None
 
 def load_portfolio_gs():
     client = get_gspread_client()
-    if not client:
-        return pd.DataFrame()
+    if not client: return pd.DataFrame()
     try:
         sheet = client.open(SHEET_NAME).sheet1
         data = sheet.get_all_records()
-        if not data:
-            return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
+        if not data: return pd.DataFrame({'代號': ['2330.TW'], '買入均價': [500.0], '持有股數': [1000]})
         return pd.DataFrame(data)
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def save_portfolio_gs(df):
     client = get_gspread_client()
-    if not client:
-        return
+    if not client: return
     try:
         sheet = client.open(SHEET_NAME).sheet1
         sheet.clear()
         sheet.update([df.columns.values.tolist()] + df.values.tolist())
         st.success("✅ 資料已同步寫入 Google Sheets！")
-    except Exception as e:
-        st.error(f"寫入試算表失敗：{str(e)}")
+    except Exception as e: st.error(f"寫入試算表失敗：{str(e)}")
 
 # --- 5. 回測引擎 ---
 def run_backtest(df, initial_capital=100000):
@@ -97,30 +114,24 @@ def run_backtest(df, initial_capital=100000):
     df['Signal'] = 0
     df.loc[(df['MA5'] > df['MA20']) & (df['MA5'].shift(1) <= df['MA20'].shift(1)), 'Signal'] = 1
     df.loc[(df['MA5'] < df['MA20']) & (df['MA5'].shift(1) >= df['MA20'].shift(1)), 'Signal'] = -1
-    
     cash = initial_capital
     position = 0
     trade_log = []
     equity_curve = []
-    
     for i in range(len(df)):
         price = df['Close'].iloc[i]
         date = df.index[i]
         signal = df['Signal'].iloc[i]
-        
         if signal == 1 and position == 0:
             position = int(cash // price)
             cash -= position * price
             trade_log.append({'Date': date, 'Type': 'Buy', 'Price': price, 'Shares': position})
-            
         elif signal == -1 and position > 0:
             cash += position * price
             trade_log.append({'Date': date, 'Type': 'Sell', 'Price': price, 'Shares': position})
             position = 0
-            
         current_equity = cash + (position * price)
         equity_curve.append(current_equity)
-        
     df['Equity'] = equity_curve
     total_return = (df['Equity'].iloc[-1] - initial_capital) / initial_capital * 100
     trades_df = pd.DataFrame(trade_log)
@@ -129,9 +140,8 @@ def run_backtest(df, initial_capital=100000):
 # --- 6. 側邊欄 ---
 with st.sidebar:
     st.header("🏯 指揮中心")
-    search_input = st.text_input("🔍 輸入代號搜尋 (Enter 確認)", placeholder="例如 2330.TW, NVDA")
+    search_input = st.text_input("🔍 輸入代號搜尋 (Enter 確認)", placeholder="例如 5478.TWO, 2330.TW")
     final_options = {}
-    
     try:
         my_portfolio = load_portfolio_gs()
         if not my_portfolio.empty and '代號' in my_portfolio.columns:
@@ -140,43 +150,33 @@ with st.sidebar:
                 if stock_symbol and stock_symbol.strip():
                     display_name = get_stock_display_name(stock_symbol)
                     final_options[f"💰 [庫存] {display_name}"] = stock_symbol
-    except:
-        pass
-    
+    except: pass
     existing_symbols = list(final_options.values())
     for name, symbol in DEFAULT_STOCKS.items():
-        if symbol not in existing_symbols:
-            final_options[name] = symbol
+        if symbol not in existing_symbols: final_options[name] = symbol
     
     if final_options:
         selected_stock_label = st.selectbox("📂 快速選單 (庫存/熱門)", list(final_options.keys()))
         selected_from_menu = final_options[selected_stock_label]
-    else:
-        selected_from_menu = "2330.TW"
+    else: selected_from_menu = "2330.TW"
 
-    if search_input:
-        ticker_symbol = search_input.upper().strip()
-    else:
-        ticker_symbol = selected_from_menu
+    if search_input: ticker_symbol = search_input.upper().strip()
+    else: ticker_symbol = selected_from_menu
 
     days_to_show = st.slider("戰場範圍 (天)", 90, 360, 180)
     st.markdown("---")
-    st.info("💡 提示：上市請加 .TW，上櫃請加 .TWO，美股直接打代號。")
-    if st.button("🔄 刷新數據"):
-        st.cache_data.clear()
+    st.info("💡 提示：上市請加 .TW，上櫃請加 .TWO (例如 5478.TWO)，美股直接打代號。")
+    if st.button("🔄 刷新數據"): st.cache_data.clear()
 
-# --- 7. 資料引擎 (技術面) ---
+# --- 7. 資料引擎 ---
 @st.cache_data(ttl=300)
 def load_data(symbol, days):
     end_date = datetime.now()
     fetch_start_date = end_date - timedelta(days=max(days + 150, 730))
     try:
         data = yf.download(symbol, start=fetch_start_date, end=end_date, progress=False)
-        if data.empty:
-            return pd.DataFrame(), 0
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        
+        if data.empty: return pd.DataFrame(), 0
+        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
         data['MA5'] = data['Close'].rolling(window=5).mean()
         data['MA20'] = data['Close'].rolling(window=20).mean()
         data['STD20'] = data['Close'].rolling(window=20).std()
@@ -192,72 +192,34 @@ def load_data(symbol, days):
         data['Returns'] = data['Close'].pct_change()
         var_95 = data['Returns'].quantile(0.05)
         return data, var_95
-    except:
-        return pd.DataFrame(), 0
+    except: return pd.DataFrame(), 0
 
 # --- 8. 資料引擎 (基本面 - 強效修復版) ---
 @st.cache_data(ttl=3600)
 def load_fundamentals_robust(symbol):
-    """
-    強效版基本面讀取：優先使用 info (預計算值)，失敗才嘗試財報表格。
-    """
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
-        
-        # 1. 嘗試直接從 info 獲取數據 (最穩)
         pe = info.get('trailingPE')
         roe = info.get('returnOnEquity')
         profit_margin = info.get('profitMargins')
-        
-        # 杜邦分析需要的三個因子
-        # 淨利率 (Net Profit Margin)
-        net_margin_val = profit_margin # 這裡直接用 info 的
-        
-        # 總資產週轉率 (Asset Turnover) = 營收 / 總資產
-        # 嘗試從 info 抓
+        net_margin_val = profit_margin
         total_revenue = info.get('totalRevenue')
         total_assets = info.get('totalAssets')
-        
-        # 權益乘數 (Equity Multiplier) = 總資產 / 股東權益
         total_equity = info.get('totalStockholderEquity')
-        
-        # 如果 info 裡缺資料，嘗試備用計算 (針對某些台股)
         if total_assets is None or total_equity is None:
-             # 嘗試讀取 Balance Sheet
              bs = ticker.balance_sheet
              if not bs.empty:
-                 # 模糊搜尋：嘗試多種可能的欄位名稱
                  for key in ['Total Assets', 'Assets', 'TotalAssets']:
                      if key in bs.index:
-                         total_assets = bs.loc[key].iloc[0]
-                         break
-                 
+                         total_assets = bs.loc[key].iloc[0]; break
                  for key in ['Stockholders Equity', 'Total Stockholder Equity', 'TotalStockholderEquity']:
                      if key in bs.index:
-                         total_equity = bs.loc[key].iloc[0]
-                         break
-                         
-        # 計算衍生指標
-        asset_turnover_val = None
-        if total_revenue and total_assets:
-            asset_turnover_val = total_revenue / total_assets
-            
-        equity_multiplier_val = None
-        if total_assets and total_equity:
-            equity_multiplier_val = total_assets / total_equity
-            
-        return {
-            'PE': pe,
-            'ROE': roe,
-            'NetMargin': net_margin_val,
-            'AssetTurnover': asset_turnover_val,
-            'EquityMultiplier': equity_multiplier_val
-        }
-
-    except Exception as e:
-        print(f"Fundamental Error: {e}")
-        return {}
+                         total_equity = bs.loc[key].iloc[0]; break
+        asset_turnover_val = total_revenue / total_assets if (total_revenue and total_assets) else None
+        equity_multiplier_val = total_assets / total_equity if (total_assets and total_equity) else None
+        return {'PE': pe, 'ROE': roe, 'NetMargin': net_margin_val, 'AssetTurnover': asset_turnover_val, 'EquityMultiplier': equity_multiplier_val}
+    except: return {}
 
 def generate_signals(df, high, low):
     last_close = df['Close'].iloc[-1]
@@ -275,83 +237,57 @@ def generate_signals(df, high, low):
         if last_close >= key_low and last_vol < key_vol * 0.6:
             wash_detected = True
             wash_sale_msg = f"""<div class="wash-sale-alert">🌊 偵測到「主力洗盤」訊號！<br>1. 發動日：{key_date} (低點 {key_low:.1f})<br>2. 狀態：量縮守支撐</div>"""
-
     diff = high - low
     fib_levels = [low + diff*0.786, low + diff*0.618, low + diff*0.236]
     pos_view, pos_action = "", ""
-    if last_close >= fib_levels[0]:
-        pos_view = "🚨 價格進入 78.6%~88.6% 主力誘多獵殺區。"
-        pos_action = "嚴禁追高，隨時準備反轉做空或獲利了結。"
-    elif last_close > fib_levels[1]:
-        pos_view = "⚠️ 價格突破 61.8%，處於相對高檔。"
-        pos_action = "多單續抱，但需提高警覺。"
-    elif last_close < fib_levels[2]:
-        pos_view = "🟢 價格處於低檔底部區。"
-        pos_action = "分批佈局，尋找長線買點。"
-    else:
-        pos_view = "⚖️ 價格處於中間震盪區域。"
-        pos_action = "依照均線趨勢順勢操作。"
-    
+    if last_close >= fib_levels[0]: pos_view, pos_action = "🚨 價格進入 78.6%~88.6% 主力誘多獵殺區。", "嚴禁追高，隨時準備反轉做空或獲利了結。"
+    elif last_close > fib_levels[1]: pos_view, pos_action = "⚠️ 價格突破 61.8%，處於相對高檔。", "多單續抱，但需提高警覺。"
+    elif last_close < fib_levels[2]: pos_view, pos_action = "🟢 價格處於低檔底部區。", "分批佈局，尋找長線買點。"
+    else: pos_view, pos_action = "⚖️ 價格處於中間震盪區域。", "依照均線趨勢順勢操作。"
     bb_upper = df['BB_Upper'].iloc[-1]
     bb_view = "🔥 股價衝破布林上軌，極短線過熱。" if last_close > bb_upper else "🌊 股價在布林通道內運行。"
     bb_action = "不宜追價，考慮調節。" if last_close > bb_upper else "觀望或區間操作。"
-    
     last_obv = df['OBV'].iloc[-1]
     last_obv_ma = df['OBV_MA'].iloc[-1]
     obv_view = "📈 OBV 位於均線之上，籌碼流入。" if last_obv > last_obv_ma else "📉 OBV 位於均線之下，籌碼流出。"
     obv_action = "主力心態偏多。" if last_obv > last_obv_ma else "主力心態保守。"
-    
     hist = df['MACD_Hist'].iloc[-1]
     prev_hist = df['MACD_Hist'].iloc[-2]
     macd_view = "🚀 紅柱持續放大，動能強勁。" if hist > 0 and hist > prev_hist else ("⚠️ 紅柱縮短，背離警戒。" if hist > 0 and hist < prev_hist else "✨ 多空膠著或空方控盤。")
     macd_action = "積極操作。" if hist > 0 and hist > prev_hist else ("設好停利。" if hist > 0 and hist < prev_hist else "保守應對。")
-
-    return {
-        "wash_detected": wash_detected, "wash_sale_msg": wash_sale_msg,
-        "position": (pos_view, pos_action), "bollinger": (bb_view, bb_action),
-        "obv": (obv_view, obv_action), "macd": (macd_view, macd_action)
-    }
+    return {"wash_detected": wash_detected, "wash_sale_msg": wash_sale_msg, "position": (pos_view, pos_action), "bollinger": (bb_view, bb_action), "obv": (obv_view, obv_action), "macd": (macd_view, macd_action)}
 
 def get_live_prices(ticker_list):
     prices = {}
-    if not ticker_list:
-        return prices
+    if not ticker_list: return prices
     try:
         data = yf.download(ticker_list, period="1d", progress=False)['Close']
-        if len(ticker_list) == 1:
-            prices[ticker_list[0]] = data.iloc[-1]
+        if len(ticker_list) == 1: prices[ticker_list[0]] = data.iloc[-1]
         else:
             for t in ticker_list:
-                try:
-                    prices[t] = data[t].iloc[-1]
-                except:
-                    prices[t] = 0
-    except:
-        pass
+                try: prices[t] = data[t].iloc[-1]
+                except: prices[t] = 0
+    except: pass
     return prices
 
 # --- 主畫面 ---
 try:
     full_df, var_95 = load_data(ticker_symbol, days_to_show)
-    
     if full_df.empty:
         st.error(f"❌ 無法取得數據：{ticker_symbol}。請確認代號是否正確。")
     else:
         df = full_df.tail(days_to_show)
-        
         last_close = df['Close'].iloc[-1]
         pct_change = df['Returns'].iloc[-1] * 100
         high_price = df['High'].max()
         low_price = df['Low'].min()
         signals = generate_signals(df, high_price, low_price)
-        
         display_name_main = get_stock_display_name(ticker_symbol)
+        
         title_col, tag_col = st.columns([3, 1])
-        with title_col:
-            st.markdown(f"## 🏯 {display_name_main} 戰略指揮所")
+        with title_col: st.markdown(f"## 🏯 {display_name_main} 戰略指揮所")
         with tag_col:
-            if signals['wash_detected']:
-                st.markdown('<div style="background:#e3f2fd; color:#0d47a1; padding:5px; border-radius:10px; text-align:center;">🌊 主力洗盤中</div>', unsafe_allow_html=True)
+            if signals['wash_detected']: st.markdown('<div style="background:#e3f2fd; color:#0d47a1; padding:5px; border-radius:10px; text-align:center;">🌊 主力洗盤中</div>', unsafe_allow_html=True)
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 技術戰情室", "🤖 AI 策略雷達", "📊 基本面體檢", "💰 我的庫存管理", "🧪 策略實驗室"])
 
@@ -371,11 +307,8 @@ try:
 
         with tab2:
             st.subheader("🤖 AI 首席分析師綜合診斷報告")
-            if signals['wash_detected']:
-                st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
-            else:
-                st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
-
+            if signals['wash_detected']: st.markdown(signals['wash_sale_msg'], unsafe_allow_html=True)
+            else: st.info("🌊 目前未偵測到明顯的「主力洗盤」訊號。")
             report_html = f"""<div class="report-box">
                 <div class="report-item"><span class="report-label">1. 戰略位階 (Fibonacci)：</span><br>觀點：<span class="report-view">{signals['position'][0]}</span><br>💡 建議：<span class="report-action">{signals['position'][1]}</span></div>
                 <div class="report-item"><span class="report-label">2. 波動風險 (Bollinger)：</span><br>觀點：<span class="report-view">{signals['bollinger'][0]}</span><br>💡 建議：<span class="report-action">{signals['bollinger'][1]}</span></div>
@@ -387,29 +320,18 @@ try:
         with tab3:
             with st.spinner('分析財報數據中...'):
                 fund_data = load_fundamentals_robust(ticker_symbol)
-                
-                # 解包數據
-                pe = fund_data.get('PE')
-                roe = fund_data.get('ROE')
-                net_margin = fund_data.get('NetMargin')
-                asset_turnover = fund_data.get('AssetTurnover')
-                equity_multiplier = fund_data.get('EquityMultiplier')
-                
-                if not fund_data:
-                    st.warning("⚠️ 此標的無詳細財報數據 (可能是 ETF 或 資料源暫時無法存取)")
+                if not fund_data: st.warning("⚠️ 此標的無詳細財報數據 (可能是 ETF 或 資料源暫時無法存取)")
                 else:
                     m1, m2 = st.columns(2)
-                    m1.metric("本益比 (PE)", f"{pe:.1f}" if pe else "N/A")
-                    m2.metric("ROE (權益報酬率)", f"{roe*100:.2f}%" if roe else "N/A")
-                    
+                    m1.metric("本益比 (PE)", f"{fund_data.get('PE', 0):.1f}" if fund_data.get('PE') else "N/A")
+                    m2.metric("ROE", f"{fund_data.get('ROE', 0)*100:.2f}%" if fund_data.get('ROE') else "N/A")
                     st.divider()
                     st.subheader("📐 杜邦分析 (DuPont Analysis)")
-                    
                     d1, d2, d3, d4 = st.columns(4)
-                    d1.metric("ROE", f"{roe*100:.2f}%" if roe else "N/A")
-                    d2.metric("純益率", f"{net_margin*100:.2f}%" if net_margin else "N/A")
-                    d3.metric("總資產週轉率", f"{asset_turnover:.2f} 次" if asset_turnover else "N/A")
-                    d4.metric("權益乘數", f"{equity_multiplier:.2f} 倍" if equity_multiplier else "N/A")
+                    d1.metric("ROE", f"{fund_data.get('ROE', 0)*100:.2f}%" if fund_data.get('ROE') else "N/A")
+                    d2.metric("純益率", f"{fund_data.get('NetMargin', 0)*100:.2f}%" if fund_data.get('NetMargin') else "N/A")
+                    d3.metric("總資產週轉率", f"{fund_data.get('AssetTurnover', 0):.2f} 次" if fund_data.get('AssetTurnover') else "N/A")
+                    d4.metric("權益乘數", f"{fund_data.get('EquityMultiplier', 0):.2f} 倍" if fund_data.get('EquityMultiplier') else "N/A")
 
         with tab4:
             st.subheader("💰 雲端庫存管理 (Google Sheets 同步)")
@@ -438,8 +360,7 @@ try:
                     st.metric("總資產市值", f"${total_val:,.0f}", f"{total_pl:+,.0f}")
                     def color_pl(val): return f'color: {"#d32f2f" if val > 0 else "#2e7d32" if val < 0 else "black"}; font-weight: bold'
                     st.dataframe(res_df.style.map(color_pl, subset=['損益', '報酬率%']).format({'現價':"{:.2f}", '市值':"{:,.0f}", '損益':"{:+,.0f}", '報酬率%':"{:+.2f}%"}), use_container_width=True)
-            else:
-                st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
+            else: st.warning("無法讀取 Google Sheet，請檢查 Secrets 設定。")
             
         with tab5:
             st.subheader("🧪 策略回測實驗室")
@@ -458,8 +379,5 @@ try:
             if not trade_log.empty:
                 st.write("📜 交易明細")
                 st.dataframe(trade_log, use_container_width=True)
-            else:
-                st.info("此期間無交易訊號触发。")
-
-except Exception as e:
-    st.error(f"系統錯誤：{str(e)}")
+            else: st.info("此期間無交易訊號触发。")
+except Exception as e: st.error(f"系統錯誤：{str(e)}")
