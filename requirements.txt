@@ -3,5 +3,7 @@ yfinance
 pandas
 numpy
 plotly
+requests
 gspread
 oauth2client
+twstock
